@@ -1,0 +1,56 @@
+/* Shared-state adapter. All writes are revision-checked database transactions. */
+(()=>{
+let client,household,revision=0,user,role,channel,busy=false,confirmed=null,demo=false,stale=false;
+const el=id=>document.getElementById(id),safe=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const config=window.APP_CONFIG||{};
+const errorText=e=>{let m=e?.message||String(e);return m.includes('REVISION_CONFLICT')?'El otro usuario modificó el hogar. Se cargó su versión; vuelve a realizar tu cambio.':m.includes('HOUSEHOLD_FULL')?'Este hogar ya tiene dos integrantes.':m.includes('VERIFY_EMAIL')?'Confirma tu correo antes de unirte.':m.includes('Invalid login')?'Correo o contraseña incorrectos.':m.includes('Failed to fetch')?'No se pudo conectar. Revisa tu conexión.':m};
+function status(text){el('sync-status').textContent=text}
+function screen(html){el('shell').hidden=true;el('auth-screen').hidden=false;el('auth-screen').innerHTML=`<div class="auth-card"><span class="brand">q.</span>${html}<p id="auth-error" class="auth-error" role="alert"></p></div>`}
+function fail(e){const target=el('auth-error');if(target)target.textContent=errorText(e);else App.notify(errorText(e));}
+function validate(s){
+ if(!s||typeof s!=='object'||!/^\d{4}-\d{2}-\d{2}$/.test(s.start)||!/^\d{4}-\d{2}-\d{2}$/.test(s.end)||s.end<=s.start||new Date(s.end)-new Date(s.start)>93*864e5)throw Error('Periodo inválido en el respaldo.');
+ for(let k of ['income','previous','reserve','voucherIncome','voucherPrevious'])if(typeof s[k]!=='number'||!Number.isFinite(s[k]))throw Error('Importes inválidos en '+k);
+ for(let k of ['expenses','products','movements','list'])if(!Array.isArray(s[k])||s[k].length>20000)throw Error('Datos inválidos en '+k);
+ for(let k of ['paid','paymentPlans','cashReady'])if(!s[k]||typeof s[k]!=='object'||Array.isArray(s[k]))throw Error('Datos inválidos en '+k);
+ const ident=x=>typeof x==='string'&&/^[a-zA-Z0-9_-]{1,100}$/.test(x),num=x=>typeof x==='number'&&Number.isFinite(x)&&x>=0;
+ for(let e of s.expenses)if(!ident(e.id)||!num(e.amount)||typeof e.name!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(e.date))throw Error('Gasto inválido.');
+ for(let p of s.products)if(!ident(p.id)||!num(p.qty)||!num(p.price)||!num(p.min)||typeof p.name!=='string'||typeof p.category!=='string'||!Array.isArray(p.history))throw Error('Producto inválido.');
+ if(new Set(s.products.map(p=>p.id)).size!==s.products.length)throw Error('Productos duplicados.');
+ for(let l of s.list)if(!ident(l.pid)||!num(l.qty)||!s.products.some(p=>p.id===l.pid))throw Error('Lista inválida.');
+ for(let [k,p] of Object.entries(s.paid))if(!ident(k)||!num(p.amount)||!num(p.voucherAmount||0)||(p.voucherAmount||0)>p.amount)throw Error('Pago inválido.');
+ for(let [k,p] of Object.entries(s.paymentPlans))if(!ident(k)||!num(p.voucherAmount||0))throw Error('Apartado inválido.');
+ for(let l of s.archivedLists||[])if(!ident(l.id)||!Array.isArray(l.items))throw Error('Historial de listas inválido.');
+ if(JSON.stringify(s).length>4500000)throw Error('El respaldo supera el tamaño permitido.');
+ return s;
+}
+async function pull(force=false){if(busy){stale=true;return}const {data,error}=await client.from('household_state').select('*').eq('household_id',household).single();if(error)throw error;if(force||data.revision>revision){revision=data.revision;let next=Object.keys(data.data).length?validate(data.data):App.seed();confirmed=structuredClone(next);App.setState(next)}status('Sincronizado')}
+async function persist(next){
+ if(busy){App.setState(confirmed);App.notify('Espera a que termine el guardado.');return false}
+ let candidate;try{candidate=validate(structuredClone(next))}catch(e){if(confirmed)App.setState(confirmed);fail(e);return false}
+ if(demo){confirmed=candidate;App.setState(candidate);status('Demo · sin nube');return true}
+ if(!client||!household){App.notify('Inicia sesión para guardar.');return false}
+ busy=true;el('saving').hidden=false;status('Guardando');let ok=false;
+ try{const {data,error}=await client.rpc('save_household_state',{p_household:household,p_expected_revision:revision,p_data:candidate});if(error)throw error;let row=data[0];revision=row.revision;confirmed=structuredClone(row.data);App.setState(confirmed);status('Sincronizado');ok=true}
+ catch(e){App.setState(confirmed);status('No guardado');busy=false;try{await pull(true)}catch{}App.notify(errorText(e))}
+ finally{busy=false;el('saving').hidden=true;if(stale){stale=false;try{await pull()}catch{status('Sin conexión')}}}
+ return ok;
+}
+function reveal(){el('auth-screen').hidden=true;el('shell').hidden=false;el('user-label').textContent=demo?'vista de prueba':user.email.split('@')[0];App.render()}
+function login(){screen(`<h1>Tu hogar, en orden.</h1><p class="muted">Entra para revisar tu quincena y compartir las compras.</p><form id="login-form"><label>Correo<input name="email" type="email" autocomplete="username" required></label><label>Contraseña<input name="password" type="password" minlength="8" autocomplete="current-password" required></label><button class="primary">Entrar</button></form><p class="muted">Las dos cuentas se crean en Supabase Authentication. Después, el propietario habilita el correo del segundo integrante.</p>`);el('login-form').onsubmit=async e=>{e.preventDefault();let f=Object.fromEntries(new FormData(e.target));e.target.querySelector('button').disabled=true;try{const {data,error}=await client.auth.signInWithPassword(f);if(error)throw error;user=data.user;await connectHome()}catch(err){fail(err);e.target.querySelector('button').disabled=false}}}
+async function connectHome(){
+ const {data:joined,error:joinError}=await client.rpc('accept_household_invite');if(joinError)throw joinError;
+ const {data,error}=await client.from('household_members').select('household_id,role').eq('user_id',user.id).maybeSingle();if(error)throw error;
+ if(!data){screen(`<h1>Tu primer hogar</h1><p class="muted">Si eres el propietario, crea el hogar. Si eres el segundo integrante, espera a que el propietario habilite tu correo.</p><form id="home-form"><label>Nombre del hogar<input name="name" maxlength="100" required value="Nuestro hogar"></label><button class="primary">Crear hogar</button></form><button id="check-invite">Revisar acceso compartido</button><button onclick="Cloud.logout()">Cerrar sesión</button>`);el('home-form').onsubmit=async e=>{e.preventDefault();try{let r=await client.rpc('create_household',{p_name:new FormData(e.target).get('name')});if(r.error)throw r.error;await connectHome()}catch(err){fail(err)}};el('check-invite').onclick=()=>connectHome().catch(fail);return}
+ household=data.household_id;role=data.role;await pull(true);reveal();if(channel)await client.removeChannel(channel);
+ channel=client.channel('household-'+household).on('postgres_changes',{event:'UPDATE',schema:'public',table:'household_state',filter:'household_id=eq.'+household},()=>pull().catch(()=>status('Sin conexión'))).subscribe(s=>{if(s==='SUBSCRIBED')status('Sincronizado');else if(s==='CHANNEL_ERROR'||s==='TIMED_OUT')status('Reconectando')});
+}
+function download(data,name){let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+function account(){let modal=el('modal');modal.innerHTML=`<h2>${demo?'Vista de prueba':'Nuestro hogar'}</h2><p class="muted">${demo?'Los cambios de esta vista se pierden al recargar.':safe(user.email)+' · '+(role==='owner'?'Propietario':'Integrante')}</p>${!demo&&role==='owner'?'<form id="invite-form"><label>Correo del segundo integrante<input type="email" name="email" required></label><button class="primary">Habilitar acceso</button><p class="muted">No envía correos. Esa persona debe tener una cuenta confirmada en este proyecto e iniciar sesión aquí.</p></form>':''}<div class="actions"><button id="export-state">Descargar respaldo</button><button id="import-button">Importar respaldo</button></div><input type="file" id="import-state" accept="application/json" hidden><p class="muted">La importación reemplaza los registros del hogar. Usa el JSON privado del demo o un respaldo de esta aplicación. Nunca lo subas al repositorio público.</p><button onclick="Cloud.logout()">${demo?'Volver al acceso':'Cerrar sesión'}</button><button onclick="document.getElementById('modal').close()">Cerrar</button>`;modal.showModal();el('export-state').onclick=()=>download(App.getState(),'quincena-respaldo.json');el('import-button').onclick=()=>el('import-state').click();el('import-state').onchange=async e=>{try{let file=e.target.files[0];if(!file)return;if(file.size>4500000)throw Error('Archivo demasiado grande.');let data=validate(JSON.parse(await file.text()));if(!confirm('¿Reemplazar los registros actuales del hogar con este respaldo?'))return;modal.close();if(await persist(data))App.notify('Datos importados y guardados.')}catch(err){App.notify(errorText(err))}};if(el('invite-form'))el('invite-form').onsubmit=async e=>{e.preventDefault();let r=await client.rpc('set_household_invite',{p_household:household,p_email:new FormData(e.target).get('email')});App.notify(r.error?errorText(r.error):'Acceso habilitado. La otra persona ya puede iniciar sesión.')};}
+async function logout(){if(busy)return;el('modal').close();if(channel){await client.removeChannel(channel);channel=null}if(client)await client.auth.signOut();household=null;user=null;confirmed=null;App.setState(App.seed());demo=false;if(client)login();else setup()}
+function setup(){screen(`<h1>Tu quincena, compartida.</h1><p>La interfaz está lista. Falta configurar el proyecto Supabase.</p><p class="muted">Completa la URL y la clave publicable en config.js, y ejecuta el archivo SQL incluido.</p><button class="primary" id="demo-start">Explorar interfaz de prueba</button>`);el('demo-start').onclick=()=>{demo=true;confirmed=App.seed();App.setState(confirmed);reveal();status('Demo · sin nube')}}
+async function start(){if(!config.supabaseUrl||!config.supabaseKey){setup();return}try{if(!/^https:\/\//.test(config.supabaseUrl)||config.supabaseKey.startsWith('sb_secret_'))throw Error('Usa una URL HTTPS y la clave publicable de Supabase.');const {createClient}=await import('https://esm.sh/@supabase/supabase-js@2.57.4');client=createClient(config.supabaseUrl,config.supabaseKey);let {data,error}=await client.auth.getSession();if(error)throw error;if(data.session){user=data.session.user;await connectHome()}else login();client.auth.onAuthStateChange(event=>{if(event==='SIGNED_OUT'){household=null;confirmed=null;App.setState(App.seed());login()}})}catch(e){screen('<h1>No pudimos conectar</h1><button onclick="location.reload()">Reintentar</button>');fail(e)}}
+window.Cloud={persist,account,logout,validate};
+window.addEventListener('online',()=>{if(household)pull().catch(()=>status('Sin conexión'))});window.addEventListener('offline',()=>status('Sin conexión · cambios no guardados'));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&household)pull().catch(()=>status('Sin conexión'))});setInterval(()=>{if(household&&!document.hidden&&!busy)pull().catch(()=>status('Sin conexión'))},30000);
+start();
+})();

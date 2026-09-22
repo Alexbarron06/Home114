@@ -1,0 +1,13 @@
+{
+  "name": "quincena-hogar",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node tests/app.cjs && node tests/database.cjs",
+    "check": "node --check public/app.js && node --check public/cloud.js"
+  },
+  "devDependencies": {
+    "jsdom": "30.1.1",
+    "@electric-sql/pglite": "0.5.8"
+  }
+}

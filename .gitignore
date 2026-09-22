@@ -1,0 +1,7 @@
+private/
+*.zip
+node_modules/
+.env*
+desktop.png
+mobile.png
+test-results/
