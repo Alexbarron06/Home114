@@ -7,4 +7,16 @@ w.addList('p0');w.addList('p1');w.selectItem('p0',true);w.checkout();submit({sto
 w.listHistory();w.reuseList(s.archivedLists[0].id);assert.equal(w.App.getState().list.length,2);w.newList();submit({name:'Nueva compra'});assert.equal(w.App.getState().list.length,0);assert.equal(w.App.getState().archivedLists.length,2);
 w.planPayment('2026-09-23-leche');submit({method:'vouchers'});assert.equal(w.totals().voucherFree,466);let balance=w.totals().free;w.pay('2026-09-23-leche');submit({amount:219,method:'vouchers'});assert.equal(w.totals().free,balance);assert.equal(w.totals().voucherFree,466);
 w.pay('2026-09-25-5');submit({amount:1400,method:'vouchers'});assert(!w.App.getState().paid['2026-09-25-5']);submit({amount:1400,method:'cash'});assert.equal(w.App.getState().paid['2026-09-25-5'].method,'cash');
+// Aisle edits are shared state, but must not change balances or inventory.
+await w.Cloud.persist(initial);w.navigate('Comprar');w.addList('p0');w.addList('p1');
+w.listQty('p0','0.465');w.cartPrice('p0','100.50');w.selectItem('p0',true);
+assert.equal(w.cartTotal(),46.73);assert.equal(w.App.getState().products[0].qty,0.46);assert.equal(w.App.getState().products[0].price,105);assert.equal(w.App.getState().expenses.length,1);
+w.selectItem('p0',false);assert.equal(w.cartTotal(),0);w.selectItem('p0',true);
+w.cartPrice('p0','-1');assert.equal(w.cartTotal(),46.73);
+w.shoppingPayment();submit({method:'vouchers'});w.checkout();assert.equal(w.document.querySelector('dialog form').elements.namedItem('method').value,'vouchers');
+// A remote cart edit while confirmation is open must require another review.
+let remote=w.App.getState();remote.list[0].qty=0.5;w.App.setState(remote);submit({store:'Prueba'});assert.equal(w.App.getState().expenses.length,1);
+w.checkout();submit({store:'Prueba',date:'2026-09-23'});await Promise.resolve();let purchased=w.App.getState();assert.equal(purchased.expenses.at(-1).amount,50.25);assert.equal(purchased.products[0].qty,0.96);assert.equal(purchased.list.length,1);assert.equal(purchased.archivedLists.at(-1).items[0].price,100.50);
+w.quickProduct();submit({name:'Extra',qty:'2',price:'12.50'});assert.equal(w.App.getState().products.at(-1).qty,0);assert.equal(w.App.getState().list.length,2);assert.equal(w.App.getState().expenses.length,2);
+console.log('PASS carrito: precios, cantidades, sin gasto anticipado, pago previsto, cambios remotos y compra parcial.');
 let bad=structuredClone(initial);bad.products[0].id="' onclick='evil";assert.throws(()=>w.Cloud.validate(bad),/Producto inválido/);let current=w.App.getState();assert.equal(current.expenses.filter(e=>e.id==='test-expense').length,1);console.log('PASS DOM: seis vistas, importación, compra parcial, inventario, vales, listas, pago sin doble descuento, efectivo Rufi, validación del respaldo.');w.close()})().catch(e=>{console.error(e);w.close();process.exit(1)});
